@@ -28,6 +28,8 @@ pub struct Command {
     pub redirects: Vec<Word>,
     /// Commands nested in `$(…)` / `<(…)` inside the arguments or redirects.
     pub substitutions: Vec<Command>,
+    /// Variables tested by the conditions this command runs under: the `if`/`elif`/`while`
+    pub guards: Vec<String>,
     pub span: Span,
 }
 
@@ -85,10 +87,21 @@ impl Node {
 
 /// A lowered script: source text plus its nodes in source order.
 /// A pipeline precedes its stage commands; substituted commands follow their host.
+/// A shell program the script writes to disk (`cat > "$BIN/tool" <<'EOF'` + `#!/bin/sh`).
+/// Its commands are lowered like the rest of the script; `span` tells which ones they are.
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub span: Span,
+    /// Where it is written, when the redirect or `tee` operand says so.
+    pub target: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub source: String,
     pub nodes: Vec<Node>,
+    /// Programs the script leaves behind, in source order.
+    pub programs: Vec<Program>,
     /// Host the script itself was fetched from, when known (forwarded layers). `None` in pipe mode.
     pub origin_host: Option<String>,
     /// The full URL the script was fetched from, when known.
@@ -116,11 +129,13 @@ pub fn parse(source: &str) -> Result<Ctx> {
     let mut walker = Walker {
         src: source,
         nodes: Vec::new(),
+        programs: Vec::new(),
     };
     walker.walk(tree.root_node());
     Ok(Ctx {
         source: source.to_owned(),
         nodes: walker.nodes,
+        programs: walker.programs,
         origin_host: None,
         origin: None,
     })
@@ -129,6 +144,7 @@ pub fn parse(source: &str) -> Result<Ctx> {
 struct Walker<'s> {
     src: &'s str,
     nodes: Vec<Node>,
+    programs: Vec<Program>,
 }
 
 impl<'s> Walker<'s> {
@@ -159,7 +175,14 @@ impl<'s> Walker<'s> {
                 }
             }
             // `sudo bash <<SCRIPT … SCRIPT`: the body is the real installer.
-            "heredoc_body" if self.heredoc_feeds_shell(n) => {
+            // `cat > "$BIN/tool" <<'EOF'` + `#!/bin/sh`: the body is a program the installer leaves behind.
+            "heredoc_body" if self.heredoc_feeds_shell(n) || self.heredoc_is_shell_program(n) => {
+                if !self.heredoc_feeds_shell(n) {
+                    self.programs.push(Program {
+                        span: n.byte_range(),
+                        target: self.heredoc_target(n),
+                    });
+                }
                 if let Ok(tree) = parse_range(self.src, n.byte_range()) {
                     self.walk(tree.root_node());
                 }
@@ -184,6 +207,44 @@ impl<'s> Walker<'s> {
             .child_by_field_name("body")
             .filter(|c| c.kind() == "command")
             .is_some_and(|c| SHELLS.contains(&self.command(c).name.as_str()))
+    }
+
+    /// The body opens with a shell shebang, so it is a script being written to disk.
+    fn heredoc_is_shell_program(&self, body: TsNode) -> bool {
+        let text = self.src[body.byte_range()].trim_start();
+        let Some(shebang) = text.strip_prefix("#!") else {
+            return false;
+        };
+        shebang
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().last())
+            .map(|interp| interp.rsplit('/').next().unwrap_or(interp))
+            .is_some_and(|interp| SHELLS.contains(&interp))
+    }
+
+    /// The file a heredoc is written to: the `>` target, or `tee`'s operand.
+    fn heredoc_target(&self, body: TsNode) -> Option<String> {
+        let statement = body
+            .parent()
+            .and_then(|r| r.parent())
+            .filter(|s| s.kind() == "redirected_statement")?;
+        let cmd = statement
+            .child_by_field_name("body")
+            .filter(|c| c.kind() == "command")
+            .map(|c| self.command(c))?;
+        let file = |w: &Word| {
+            (!w.text.is_empty() && !w.text.starts_with('&') && w.text != "/dev/null")
+                .then(|| w.text.clone())
+        };
+        if crate::config::base_name(&cmd.name) == "tee" {
+            return cmd
+                .args
+                .iter()
+                .find(|a| !a.text.starts_with('-'))
+                .and_then(file);
+        }
+        cmd.redirects.iter().find_map(file)
     }
 
     fn command(&self, n: TsNode) -> Command {
@@ -223,10 +284,70 @@ impl<'s> Walker<'s> {
             substitutions,
             elevated: false,
             captured,
+            guards: self.guards(n),
             span: n.byte_range(),
         };
         strip_privilege_wrapper(&mut cmd);
         cmd
+    }
+
+    /// Variables referenced by every condition that decides whether `n` runs.
+    fn guards(&self, n: TsNode) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut child = n;
+        while let Some(parent) = child.parent() {
+            let conditions: Vec<TsNode> = match parent.kind() {
+                "if_statement" | "while_statement" | "until_statement" => {
+                    let mut cursor = parent.walk();
+                    let conds: Vec<TsNode> = parent
+                        .children_by_field_name("condition", &mut cursor)
+                        .collect();
+                    if conds.iter().any(|c| c.id() == child.id()) {
+                        Vec::new()
+                    } else {
+                        conds
+                    }
+                }
+                // `elif` has no field: the condition is the first named child.
+                "elif_clause" => named_children(parent)
+                    .next()
+                    .filter(|c| c.id() != child.id())
+                    .into_iter()
+                    .collect(),
+                "list" => {
+                    let mut kids = named_children(parent);
+                    match (kids.next(), kids.next()) {
+                        (Some(left), Some(right)) if right.id() == child.id() => vec![left],
+                        _ => Vec::new(),
+                    }
+                }
+                "case_statement" => parent
+                    .child_by_field_name("value")
+                    .filter(|v| v.id() != child.id())
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for cond in conditions {
+                self.variable_names(cond, &mut out);
+            }
+            child = parent;
+        }
+        out
+    }
+
+    fn variable_names(&self, n: TsNode, out: &mut Vec<String>) {
+        if n.kind() == "variable_name" {
+            let name = self.text(n).to_owned();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            return;
+        }
+        let mut cursor = n.walk();
+        for c in n.children(&mut cursor) {
+            self.variable_names(c, out);
+        }
     }
 
     /// The file a redirect points at (`>> ~/.bashrc` -> `~/.bashrc`).
@@ -251,7 +372,25 @@ impl<'s> Walker<'s> {
     fn assignment(&self, n: TsNode) -> Option<Assignment> {
         let name = self.text(n.child_by_field_name("name")?).to_owned();
         let value = match n.child_by_field_name("value") {
-            Some(v) => self.word(v),
+            Some(v) => {
+                let mut w = self.word(v);
+                // tree-sitter-bash ends the value early in `X=$a:b:$c/d` (the `$c/d` becomes a
+                // stray sibling); keep the rest of the word from the source.
+                let tail_end = self.src[v.end_byte()..]
+                    .find(|ch: char| ch.is_whitespace() || ";&|)<>#".contains(ch))
+                    .map_or(self.src.len(), |i| v.end_byte() + i);
+                let tail = &self.src[v.end_byte()..tail_end];
+                if !tail.is_empty() {
+                    // The dangling `$` is an anonymous child the flattening skipped.
+                    if self.text(v).ends_with('$') && !w.text.ends_with('$') {
+                        w.text.push('$');
+                    }
+                    w.text.push_str(tail);
+                    w.literal &= !tail.contains(['$', '`']);
+                    w.span.end = tail_end;
+                }
+                w
+            }
             None => Word {
                 text: String::new(),
                 span: n.end_byte()..n.end_byte(),
@@ -441,6 +580,51 @@ mod tests {
     }
 
     #[test]
+    fn lowers_heredocs_that_are_shell_programs() {
+        let src = "cat > \"$B/bin/tool\" <<'EOF'\n#!/bin/sh\ncurl -fsSL https://x.io/a -o a\nEOF\ncat > notes <<'EOF'\n#!/usr/bin/env python3\ncurl https://ignored.io\nEOF\ncat <<EOF\ncurl https://ignored.io | sh\nEOF\n";
+        let ctx = parse(src).unwrap();
+        let names: Vec<_> = ctx.commands().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["cat", "curl", "cat", "cat"]);
+        assert_eq!(ctx.programs.len(), 1);
+        assert_eq!(ctx.programs[0].target.as_deref(), Some("$B/bin/tool"));
+        assert_eq!(
+            &src[ctx.programs[0].span.clone()].trim(),
+            &"#!/bin/sh\ncurl -fsSL https://x.io/a -o a"
+        );
+        let tee =
+            parse("$SUDO tee ${KILL_SH} >/dev/null << \\EOF\n#!/bin/sh\nrm -f x\nEOF\n").unwrap();
+        assert_eq!(tee.programs[0].target.as_deref(), Some("${KILL_SH}"));
+        assert!(
+            parse("bash <<EOF\n#!/bin/sh\nls\nEOF\n")
+                .unwrap()
+                .programs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn records_guard_variables() {
+        let src = "if [ -z \"$A\" ]; then x; elif [ -n \"${B:-}\" ]; then ( r=$(curl u) ) & fi\n[ -n \"$C\" ] || curl v\ncase ${D:-} in 1) ;; *) curl w;; esac\ncurl free\ncurl guardless && [ \"$E\" ]\n";
+        let ctx = parse(src).unwrap();
+        let curls: Vec<(String, Vec<String>)> = ctx
+            .commands()
+            .filter(|c| c.name == "curl")
+            .map(|c| (c.args[0].text.clone(), c.guards.clone()))
+            .collect();
+        let g = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            curls,
+            [
+                ("u".into(), g(&["B", "A"])),
+                ("v".into(), g(&["C"])),
+                ("w".into(), g(&["D"])),
+                ("free".into(), vec![]),
+                ("guardless".into(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
     fn lowers_assignments() {
         let ctx = parse("URL=\"https://a.io\"\nexport X=1\n").unwrap();
         let a: Vec<_> = ctx
@@ -448,5 +632,27 @@ mod tests {
             .map(|a| (a.name.as_str(), a.value.text.as_str()))
             .collect();
         assert_eq!(a, [("URL", "https://a.io"), ("X", "1")]);
+    }
+
+    #[test]
+    fn keeps_the_tail_tree_sitter_splits_off() {
+        let ctx = parse(
+            "export PATH=$PATH:$bin:$bin/aux
+X=$a:b:$c/d; Y=1
+",
+        )
+        .unwrap();
+        let a: Vec<_> = ctx
+            .assignments()
+            .map(|a| (a.name.as_str(), a.value.text.as_str()))
+            .collect();
+        assert_eq!(
+            a,
+            [
+                ("PATH", "$PATH:$bin:$bin/aux"),
+                ("X", "$a:b:$c/d"),
+                ("Y", "1")
+            ]
+        );
     }
 }
